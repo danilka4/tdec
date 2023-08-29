@@ -107,11 +107,11 @@ class TDEC:
         model = None
         if self.compass == None or self.init_mode != "copy":
             if self.mode == "dm":
-                model = Doc2Vec(size=self.size, alpha=self.static_alpha, iter=self.static_iter,
+                model = Doc2Vec(vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
                              negative=self.negative,
                              window=self.window, min_count=self.min_count, workers=self.workers)
             elif self.mode == "dbow":
-                model = Doc2Vec(dm=0, dbow_words=1, size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+                model = Doc2Vec(dm=0, dbow_words=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
                                  negative=self.negative,
                                  window=self.window, min_count=self.min_count, workers=self.workers)
             else:
