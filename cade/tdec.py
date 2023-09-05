@@ -4,21 +4,22 @@
 
 import gensim
 from gensim.models.doc2vec import Doc2Vec
-from gensim.models.word2vec import Word2Vec
 from gensim.models import doc2vec
+
+import pickle
 
 import os
 import numpy as np
-import logging
 import copy
 
 
 class TDEC:
     """
+    Temporal Document Embeddings in a Compass
     Handles alignment between multiple slices of text
     """
     def __init__(self, size=100, mode="dm", siter=5, diter=5, ns=10, window=5, alpha=0.025,
-                            min_count=5, workers=2, test = "test", opath="model", init_mode="hidden"):
+                            min_count=5, workers=2, init_mode="hidden"):
         """
 
         :param size: Number of dimensions. Default is 100.
@@ -50,121 +51,93 @@ class TDEC:
         self.dynamic_alpha = alpha
         self.min_count = min_count
         self.workers = workers
-        self.test = test
-        self.opath = opath
         self.init_mode = init_mode
         self.compass = None
+        self.trained_slices = {}
 
-        if not os.path.isdir(self.opath):
-            os.makedirs(self.opath)
-        with open(os.path.join(self.opath, "log.txt"), "w") as f_log:
-            f_log.write(str("")) # todo args
-            f_log.write('\n')
-            logging.basicConfig(filename=os.path.realpath(f_log.name),
-                                format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+    def train_compass(self, corpus_file, keep_wv_dv = False):
+        if self.mode == "dm":
+            self.compass = Doc2Vec(vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+                         negative=self.negative,
+                         window=self.window, min_count=self.min_count, workers=self.workers)
+        elif self.mode == "dbow":
+            self.compass = Doc2Vec(dm=0, dbow_words=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+                             negative=self.negative,
+                             window=self.window, min_count=self.min_count, workers=self.workers)
+        else:
+            return Exception('Set "mode" to be "dm" or "dbow"')
+        self.compass.build_vocab(corpus_file=corpus_file)
+        self.compass.train(corpus_file=corpus_file,
+              total_words=self.compass.corpus_total_words, epochs=self.static_iter, compute_loss=True)
+        self.compass.learn_hidden = False
+        if not keep_wv_dv:
+#             self.compass.init_weights()
+            self.compass.wv.resize_vectors()
+#             self.compass.dv = gensim.models.KeyedVectors(vector_size=self.size)
+#             self.compass.dv = None
 
-    def initialize_from_compass(self, model):
-
-        print("Initializing embeddings from compass.")
-
-        if self.init_mode == "copy":
-            model = copy.deepcopy(self.compass)
-            model.learn_hidden = False
-            model.alpha = self.dynamic_alpha
-            model.iter = self.dynamic_iter
-            return model
-
-        if self.compass.layer1_size != self.size:
-            return Exception("Compass and Slice have different vector sizes")
-        vocab_m = model.wv.index2word
-        indices = [self.compass.wv.vocab[w].index for w in vocab_m]
-
-        # intialize syn1neg with compass embeddings
-        new_syn1neg = np.array([self.compass.syn1neg[index] for index in indices])
-        model.syn1neg = new_syn1neg
-
-        if self.init_mode == "both":
-            new_syn0 = np.array([self.compass.wv.syn0[index] for index in indices])
-            model.wv.syn0 = new_syn0
-
+    def _initialize_model(self):
+        model = copy.deepcopy(self.compass)
         model.learn_hidden = False
         model.alpha = self.dynamic_alpha
         model.iter = self.dynamic_iter
         return model
 
-    def internal_trimming_rule(self, word, count, min_count):
-        """
-        Internal rule used to trim words
-        :param word:
-        :return:
-        """
-        if word in self.gvocab:
-            return gensim.utils.RULE_KEEP
-        else:
-            return gensim.utils.RULE_DISCARD
-
-    def train_model(self, sentences):
-        model = None
-        if self.compass == None or self.init_mode != "copy":
-            if self.mode == "dm":
-                model = Doc2Vec(vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
-                             negative=self.negative,
-                             window=self.window, min_count=self.min_count, workers=self.workers)
-            elif self.mode == "dbow":
-                model = Doc2Vec(dm=0, dbow_words=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
-                                 negative=self.negative,
-                                 window=self.window, min_count=self.min_count, workers=self.workers)
-            else:
-                return Exception('Set "mode" to be "dm" or "dbow"')
-            model.build_vocab(sentences, trim_rule=self.internal_trimming_rule if self.compass != None else None)
-        if self.compass != None:
-            model = self.initialize_from_compass(model)
-        model.train(sentences, total_words=sum([len(s) for s in sentences]), epochs=model.epochs, compute_loss=True)
-        return model
-
-    def train_compass(self, compass_text, keep_dv = False, overwrite=False, save=False, compass_name="compass.model"):
-        compass_exists = os.path.isfile(os.path.join(self.opath, compass_name))
-        if compass_exists and not overwrite:
-            print("Compass is being loaded from file.")
-            self.compass = Doc2Vec.load(os.path.join(self.opath, compass_name))
-            self.gvocab = self.compass.wv.vocab
-            return
-        sentences = gensim.models.word2vec.PathLineSentences(compass_text)
-        #[doc2vec.TaggedDocument(doc, [key]) for key, doc in texts.items()]
-        sentences.input_files = [s for s in sentences.input_files if not os.path.basename(s).startswith('.')]
-        print("Training the compass from scratch.")
-        if compass_exists:
-            print("Current saved compass will be overwritten after training")
-        self.compass = self.train_model(sentences)
-        if not keep_dv:
-            self.compass.dv = gensim.models.KeyedVectors(vector_size=100)
-        if save:
-            self.compass.save(os.path.join(self.opath, compass_name))
-        self.gvocab = self.compass.wv.vocab
-
-    def train_slice(self, slice_text, slice_titles=None, save=False):
+    def train_slice(self, slice_text, slice_titles=None, out_name = None, csave=False, fsave=False):
         """
         Training a slice of text
         :param slice_text:
-        :param save:
-        :return:
+        :param slice_titles:
+        :param out_name: output name/file path
+        :param csave: save to compass
+        :param fsave: save to file
+        :return: model
         """
         if self.compass == None:
             return Exception("Missing Compass")
-        print("Training embeddings: slice {}.".format(slice_text))
+        if csave and not out_name:
+            return Exception("Specify compass name using 'out_name'")
+        if fsave and not out_name:
+            return Exception("Specify output file using 'out_name' to save")
 
+        if not csave and not fsave:
+            print("Warning: You don't save to anything. Save to compass with 'csave' or to file with 'fsave'")
         sentences = None
         if slice_titles:
             sentences = [doc2vec.TaggedDocument(doc, [title]) for doc, title in zip(slice_text, slice_titles)]
         else:
             sentences = [doc2vec.TaggedDocument(doc, [i]) for i, doc in enumerate(slice_text)]
-        model = self.train_model(sentences)
 
-        model_name = os.path.splitext(os.path.basename(slice_text))[0]
+        model = self._initialize_model()
+#         model.dv.index_to_key = slice_titles
+#         model.dv.vectors = np.zeros([len(titles), self.size])
+        model.dv.index_to_key = []
+        model.dv.vectors = np.zeros([0, self.size])
+        model.build_vocab(sentences, update=True)
+        model.dv.resize_vectors()
+#         model.dv.vectors_lockf = np.ones(len(sentences), dtype=np.float32)
+        model.train(sentences,
+              total_words=self.compass.corpus_total_words, epochs=self.dynamic_iter, compute_loss=True)
+        if csave:
+            model_name = os.path.splitext(os.path.basename(out_name))[0]
+            self.trained_slices[model_name] = model
 
-        self.trained_slices[model_name] = model
+        if save and out_name:
+            model.save(out_name)
 
-        if save:
-            model.save(os.path.join(self.opath, model_name + ".model"))
+        return model
+def save(obj, fname):
+    """
+    pickle wrapper for saving CADE
+    """
+    with open(fname, 'wb') as fout:  # 'b' for binary, needed on Windows
+        pickle.dump(obj, fout)
 
-        return self.trained_slices[model_name]
+
+def load(fname):
+    """
+    pickle wrapper for loading CADE
+
+    """
+    with open(fname, 'rb') as f:
+        return pickle.load(f, encoding='latin1')  # needed because loading from S3 doesn't support readline()
