@@ -2,8 +2,8 @@
 
 """Main module."""
 
-import gensim
 from gensim.models.doc2vec import Doc2Vec
+from gensim.models.word2vec import Word2Vec
 from gensim.models import doc2vec
 
 import pickle
@@ -55,26 +55,27 @@ class TDEC:
         self.compass = None
         self.trained_slices = {}
 
-    def train_compass(self, corpus_file, keep_wv_dv = False):
+    def train_compass(self, corpus_file=None, sentences=None):
         if self.mode == "dm":
-            self.compass = Doc2Vec(vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+            self.compass = Word2Vec(sg=0, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
                          negative=self.negative,
                          window=self.window, min_count=self.min_count, workers=self.workers)
         elif self.mode == "dbow":
-            self.compass = Doc2Vec(dm=0, dbow_words=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+            self.compass = Word2Vec(sg=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
                              negative=self.negative,
                              window=self.window, min_count=self.min_count, workers=self.workers)
         else:
             return Exception('Set "mode" to be "dm" or "dbow"')
-        self.compass.build_vocab(corpus_file=corpus_file)
-        self.compass.train(corpus_file=corpus_file,
-              total_words=self.compass.corpus_total_words, epochs=self.static_iter, compute_loss=True)
+        if corpus_file:
+            self.compass.build_vocab(corpus_file=corpus_file)
+            self.compass.train(corpus_file=corpus_file,
+                  total_words=self.compass.corpus_total_words, epochs=self.static_iter, compute_loss=True)
+        elif sentences:
+            self.compass.build_vocab(sentences=sentences)
+            self.compass.train(sentences=sentences,
+                  total_words=self.compass.corpus_total_words, epochs=self.static_iter, compute_loss=True)
+
         self.compass.learn_hidden = False
-        if not keep_wv_dv:
-#             self.compass.init_weights()
-            self.compass.wv.resize_vectors()
-#             self.compass.dv = gensim.models.KeyedVectors(vector_size=self.size)
-#             self.compass.dv = None
 
     def _initialize_model(self):
         model = copy.deepcopy(self.compass)
@@ -108,16 +109,31 @@ class TDEC:
         else:
             sentences = [doc2vec.TaggedDocument(doc, [i]) for i, doc in enumerate(slice_text)]
 
-        model = self._initialize_model()
-#         model.dv.index_to_key = slice_titles
-#         model.dv.vectors = np.zeros([len(titles), self.size])
-        model.dv.index_to_key = []
-        model.dv.vectors = np.zeros([0, self.size])
-        model.build_vocab(sentences, update=True)
-        model.dv.resize_vectors()
+        if self.mode == "dm":
+            model = Doc2Vec(vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+                         negative=self.negative,
+                         window=self.window, min_count=self.min_count, workers=self.workers)
+        elif self.mode == "dbow":
+            model = Doc2Vec(dm=0, dbow_words=1, vector_size=self.size, alpha=self.static_alpha, epochs=self.static_iter,
+                             negative=self.negative,
+                             window=self.window, min_count=self.min_count, workers=self.workers)
+        else:
+            return Exception('Set "mode" to be "dm" or "dbow"')
+        model.build_vocab(sentences)
+
+        vocab_m = model.wv.index_to_key
+        indices = [self.compass.wv.index_to_key.index(w) for w in vocab_m]
+        new_syn1neg = np.array([self.compass.syn1neg[index] for index in indices])
+        model.syn1neg = new_syn1neg
+        model.learn_hidden = False
+        model.alpha = self.dynamic_alpha
+        model.iter = self.dynamic_iter
+#         model.dv.index_to_key = []
+#         model.dv.vectors = np.zeros([0, self.size])
+#         model.dv.resize_vectors()
 #         model.dv.vectors_lockf = np.ones(len(sentences), dtype=np.float32)
         model.train(sentences,
-              total_words=self.compass.corpus_total_words, epochs=self.dynamic_iter, compute_loss=True)
+              total_words=model.corpus_total_words, epochs=self.dynamic_iter, compute_loss=True)
         if csave:
             model_name = os.path.splitext(os.path.basename(out_name))[0]
             self.trained_slices[model_name] = model
