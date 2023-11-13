@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [project]
 name = "temporal_embeddings_compass"
-version = "0.0.1"
+version = "0.1.0"
 authors = [
 { name="Daniel Palamarchuk", email="d4n1elp@vt.edu" },
 ]
