@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
+import sys
+import traceback
 import logging
 import gensim
+import os
 from os.path import basename, splitext
+import re
 from gensim.models.word2vec import Word2Vec
 from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 import numpy as np
 from umap import UMAP
 import hdbscan
+from hdbscan.flat import HDBSCAN_flat, approximate_predict_flat
+from hdbscan import HDBSCAN
 import pickle
 from collections import Counter
 import math
-from hdbscan.flat import HDBSCAN_flat, approximate_predict_flat
 import datetime
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from gensim.models.coherencemodel import CoherenceModel
 from gensim import corpora
 
@@ -320,9 +326,11 @@ class TTEC(TDEC):
         super().__init__(size=size, mode=mode, siter=siter, diter=diter,
                                    ns=ns, window=window, alpha=alpha,
                                    min_count=min_count, workers=workers, log=log, log_name=log_name)
-    def train_compass(self, corpus_file=None, sentences=None, create_topics=True):
+    def train_compass(self, corpus_file=None, sentences=None, create_topics=True, neighbors_2d = 15):
         try:
             super().train_compass(corpus_file=corpus_file, sentences=sentences, create_documents=True)
+            self.compass_umap_2d = UMAP(n_neighbors = neighbors_2d).fit(self.compass.docvecs.vectors_docs)
+            logging.info("2D umap created")
             logging.info("Compass trained")
             if create_topics:
                 self.remake_topic_embeddings(None, None)
@@ -622,6 +630,7 @@ class TimeSlice:
         self.topic_summary = topic_summary
     def new_topic_embeddings(self, ttec_model:TTEC, similarity_method="vote", n_terms=10):
         self.reduction, self.topics = ttec_model._fit_to_global_topics(self.model.docvecs.vectors_docs)
+        self.umap_2d = ttec_model.compass_umap_2d.transform(self.model.docvecs.vectors_docs)
         og_n_terms = ttec_model.n_terms
         ttec_model.n_terms = n_terms
         self.topic_summary = ttec_model._create_topic_summary(self.model, self.topics, similarity_method=similarity_method)
@@ -690,10 +699,8 @@ class TTEC_wrapper:
             sentences = [TaggedDocument(sentence, [i]) for i, sentence in enumerate(self.sentences)]
         else:
             sentences = None
-        self.compass.train_compass(sentences=sentences, corpus_file=self.corpus_file)
+        self.compass.train_compass(sentences=sentences, corpus_file=self.corpus_file, neighbors_2d=neighbors_2d)
         logging.info("Compass made")
-        self.compass_umap_2d = UMAP(n_neighbors = neighbors_2d).fit(self.compass.compass.docvecs.vectors_docs)
-        logging.info("2D umap created")
     def _obtain_sentence_subset(self, i):
         """
         Obtains the data for a particular time slice
@@ -737,7 +744,7 @@ class TTEC_wrapper:
             slic = self.compass.train_slice(sentences=sentences_in_range, similarity_method = self.similarity_method,
                                             fsave=False, create_topics=create_topics)
             if create_topics:
-                slic.umap_2d = self.compass_umap_2d.transform(slic.model.docvecs.vectors_docs)
+                slic.umap_2d = self.compass.compass_umap_2d.transform(slic.model.docvecs.vectors_docs)
             slic.i = i
             logging.info(f"Trained time slice {self.name(i)}")
             return slic
@@ -763,7 +770,7 @@ class TTEC_wrapper:
                     set_num_threads(cur_threads)
                 for i in self.slices:
                     self.slices[i].new_topic_embeddings(self.compass, similarity_method=self.similarity_method, n_terms=self.n_terms)
-                    self.slices[i].umap_2d = self.compass_umap_2d.transform(self.slices[i].model.docvecs.vectors_docs)
+                    self.slices[i].umap_2d = self.compass.compass_umap_2d.transform(self.slices[i].model.docvecs.vectors_docs)
                     logging.info(f"Slice {i} topics made")
         else:
             for i in range(len(self.time_intervals) - 1):
@@ -814,11 +821,46 @@ class TTEC_wrapper:
         """
         if n_terms:
             n_terms = min(n_terms, self.n_terms)
-        comp_df = pd.DataFrame({'x': self.compass_umap_2d.embedding_[:,0],
-                              'y': self.compass_umap_2d.embedding_[:,1],
+        comp_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
+                              'y': self.compass.compass_umap_2d.embedding_[:,1],
                                'topic': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
                                })
         fig = px.scatter(comp_df, x='x', y='y', color='topic', opacity=alpha, title="Compass")
+        fig.show()
+    def plot_compass_term(self, term = None, n_terms = None, years = None):
+        if not term:
+            print("Please say what term(s) you want")
+            return
+        elif type(term) == str:
+            term = [term]
+        if not years:
+            years = self.slices.keys()
+        if n_terms:
+            n_terms = min(n_terms, self.n_terms)
+            
+        fig = make_subplots(rows=1, cols=1)
+        for tn in np.unique(self.compass.global_topics):
+            if tn == -1:
+                continue
+            sub = self.compass.compass_umap_2d.embedding_[[i for i,topic in enumerate(self.compass.global_topics) if topic == tn],:]
+            if n_terms > 0:
+                nam = f"{tn} - {','.join(self.compass.global_topic_summary[tn]['topn'][0:n_terms])} "
+            else:
+                nam = str(tn)
+            fig.add_trace(go.Scatter(x=sub[:,0], y=sub[:,1], mode="markers", name=nam))
+        for t in term:
+            term_id = []
+            term_vectors = []
+            for year in years:
+                slic = self.slices[year]
+                if t not in slic.model.wv.index2word:
+                    continue
+                term_id.append(f"{t} - {year}")
+                term_vectors.append(slic.model.wv[t])
+            if len(term_vectors) > 0:
+                twod = self.compass.compass_umap_2d.transform(term_vectors)
+                lis_df = pd.DataFrame({'name': term_id, 'x': twod[:,0] , 'y': twod[:,1]})
+                fig.add_trace(go.Scatter(x=lis_df["x"], y=lis_df["y"], text=lis_df["name"], mode="markers+text+lines", line=dict(color="black"), textposition=improve_text_position(lis_df.index), name=t))
         fig.show()
     def plot_slice(self, slice_num, n_terms = None):
         """
@@ -840,8 +882,8 @@ class TTEC_wrapper:
         Plots all time slices and compass with a slider
         """
         fig = go.Figure()
-        wrap_df = pd.DataFrame({'x': self.compass_umap_2d.embedding_[:,0],
-                                          'y': self.compass_umap_2d.embedding_[:,1],
+        wrap_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
+                                          'y': self.compass.compass_umap_2d.embedding_[:,1],
                                           'topic': map(str,self.compass.global_topics.tolist()),#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrapper.compass.global_topics.tolist()],
                                           'date': "compass",
                                           'name': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
@@ -931,6 +973,511 @@ class TTEC_wrapper:
         else:
             return np.mean(sums)
 
+class TTEC_big:
+    """
+    Wrapper that automatically creates time slices for big data using time stamp
+    (akin to BERTopic). Might be useful to merge this into TTEC.
+    """
+    def __init__(self, corpus_file=None, size=100, mode="dm", siter=5, diter=5, ns=10, window=5, alpha=0.025,
+                    min_count=5, yearly=True, n_slices=-1, similarity_method="vote", hdbscan_selection="flat", n_terms=10,
+                    workers=2, log=False, log_name="log.txt", umap_args=None, hdbscan_args=None, n_topics = None,
+                    file_path=None, 
+                ):
+        if not corpus_file:
+            raise Exception("Select 'corpus_file'")
+        self.corpus_file = corpus_file
+        self.yearly=yearly
+        self.hdbscan_selection = hdbscan_selection
+        self.n_terms = n_terms
+        self.workers = workers
+        self.similarity_method = similarity_method
+        self.mode = mode
+        self.umap_args = umap_args
+        self.hdbscan_args = hdbscan_args
+        self.n_topics = n_topics
+        self.slice_names = []
+        if file_path:
+            self.file_path = file_path
+        else:
+            self.file_path = os.getcwd()
+        if log:
+            with open(log_name, "w") as f_log:
+                f_log.write(str("")) # todo args
+                f_log.write('\n')
+                logging.basicConfig(filename=f_log.name,
+                                    format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+        tdec = TDEC(size=size, mode=mode, siter=siter, diter=diter, ns=ns, window=window, alpha=alpha,
+                    min_count=min_count, workers=2, log=False, log_name=log_name)
+        if not os.path.exists(self.file_path):
+            os.mkdir(self.file_path)
+        data_path = os.path.join(self.file_path, "data")
+        if not os.path.exists(data_path):
+            os.mkdir(data_path)
+        slices_path = os.path.join(self.file_path, "slices")
+        if not os.path.exists(slices_path):
+            os.mkdir(slices_path)
+        save(tdec, os.path.join(self.file_path, "tdec_og.pkl"))
+        terms_path = os.path.join(self.file_path, "terms.csv")
+        if not os.path.exists(terms_path):
+            with open(terms_path, 'w') as f:
+                f.write('term,ts,x,y\n')
+        self.slices = {}
+    def train_compass(self, neighbors_2d = 15, overwrite = True):
+        """
+        Trains compass and creates 2D UMAP embedding space.
+        """
+        tdec = load(os.path.join(self.file_path, "tdec_og.pkl"))
+        tdec_path = os.path.join(self.file_path, "tdec.pkl")
+        if (overwrite and os.path.exists(tdec_path)) or not os.path.exists(tdec_path):
+            tdec.train_compass(corpus_file=self.corpus_file)
+            save(tdec, tdec_path)
+            logging.info("TDEC made")
+        else:
+            tdec = load(tdec_path)
+            logging.info("TDEC loaded")
+        umap_2d_path = os.path.join(self.file_path, "umap_2d.pkl")
+        if (overwrite and os.path.exists(umap_2d_path)) or not os.path.exists(umap_2d_path):
+            ump_2d = UMAP(n_neighbors = neighbors_2d, n_components=2, metric="cosine")
+            ump_2d.fit(tdec.compass.docvecs.vectors_docs)
+            save(ump_2d, umap_2d_path)
+            logging.info("2D UMAP made")
+            del ump_2d
+        umap_path = os.path.join(self.file_path, "umap.pkl")
+        if (overwrite and os.path.exists(umap_path)) or not os.path.exists(umap_path):
+            if self.umap_args:
+                umap_args = self.umap_args
+            else:
+                umap_args = {'n_neighbors': 15,
+                             'n_components': 5,
+                             'metric': 'cosine'}
+    #         umap_args["verbose"] = True
+            ump = UMAP(**umap_args)
+    #         umap_args["verbose"] = True
+            ump.fit(tdec.compass.docvecs.vectors_docs)
+            save(ump, umap_path)
+            logging.info("UMAP made")
+        else:
+            ump = load(umap_path)
+            logging.info("UMAP loaded")
+        del tdec
+        hdbscan_path = os.path.join(self.file_path, "hdbscan.pkl")
+        if (overwrite and os.path.exists(hdbscan_path)) or not os.path.exists(tdec_path):
+            if self.hdbscan_args:
+                hdbscan_args = self.hdbscan_args
+            else:
+                hdbscan_args = {'min_cluster_size': 15,
+                                'metric': 'euclidean',
+                                'cluster_selection_method': 'leaf',
+                               'prediction_data': True}
+            hdb = HDBSCAN(**hdbscan_args)
+            hdb.fit(ump.embedding_)
+            save(hdb, hdbscan_path)
+            logging.info("HDBSCAN made")
+        else:
+            hdb = load(hdbscan_path)
+            logging.info("HDBSCAN loaded")
+        del ump
+        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        if (overwrite and os.path.exists(topics_path)) or not os.path.exists(topics_path):
+            tdec = load(tdec_path)
+            topics = self._topic_summary(tdec.compass,  hdb.labels_)
+            save(topics, topics_path)
+            logging.info("Topics made")
+            del tdec
+            del topics
+        del hdb
+        
+    def train_slice(self, name):
+        name = str(name)
+        file_path = os.path.join(self.file_path, "data", str(name)+".txt")
+        corpus_file = None
+        try:
+            if not os.path.isfile(file_path):
+                raise Exception('Please have the text as "model_file_path/data/{name}.txt"')
+            tdec = load(os.path.join(self.file_path, "tdec.pkl"))
+            if os.path.isfile(os.path.join(self.file_path, "data", name+"_titles.txt")):
+                title_path = os.path.join(self.file_path, "data", name+"_titles.txt")
+                titles = []
+                with open(title_path, 'r') as f:
+                    for line in f:
+                        titles.append(line.rstrip())
+            elif os.path.isfile(os.path.join(self.file_path, "data", name+"_titles.pkl")):
+                title_path = os.path.join(self.file_path, "data", name+"_titles.pkl")
+                titles = load(title_path)
+            else:
+                sentences = None
+                titles = None
+                corpus_file=file_path
+            if titles:
+                with open(file_path, 'r') as f:
+                    sentences = []
+                    for i,line in enumerate(f):
+                        sentences.append(TaggedDocument(line.rstrip().split(), [titles[i]]))
+            temp_name = os.path.join(self.file_path, "slices", f"{name}.doc2vec")
+            model = tdec.train_slice(corpus_file=corpus_file, sentences=sentences)#, out_name=temp_name, fsave=True)
+            del tdec
+            logging.info(f"{name} model made")
+            ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
+            reduction_2d = ump_2d.transform(model.docvecs.vectors_docs)
+            del ump_2d
+            logging.info(f"{name} 2D reduction made")
+            ump = load(os.path.join(self.file_path, "umap.pkl"))
+            reduction = ump.transform(model.docvecs.vectors_docs)
+            del ump
+            logging.info(f"{name} reduction made")
+            hdb = load(os.path.join(self.file_path, "hdbscan.pkl"))
+            topics = hdbscan.approximate_predict(hdb, reduction)
+            topics = topics[0]
+            del hdb
+            logging.info(f"{name} topic numbers made")
+            topic_summary = self._topic_summary(model, topics)
+            logging.info(f"{name} topic summary made")
+            ts = TimeSlice(model)
+            ts.reduction = reduction
+            ts.umap_2d = reduction_2d
+            ts.topics = topics
+            ts.topic_summary = topic_summary
+            save(ts, os.path.join(self.file_path, "slices", f"{name}.pkl"))
+            logging.info(f"{name} TimeSlice saved")
+            self.slice_names.append(name)
+            self.slice_names = list(set(self.slice_names))
+            self.slice_names.sort()
+            del model
+            del reduction_2d
+            del topics
+            del topic_summary
+            del ts
+        except Exception:
+            logging.error(traceback.format_exc())
+    def train_slices(self, names, parallel = False, verbose = False):
+        """
+        Trains time slices. Parallel option uses a ProcessPoolExecutor,
+        but does not work as intended. A ProcessPoolExecutor created outside
+        this class will work.
+        """
+        executor = ProcessPoolExecutor(max_workers=self.workers)
+        for name in names:
+            executor.submit(self.train_slice, str(name))
+            logging.info(f"Slice {name} submitted")
+    def _topic_summary(self, model, topics):
+        topic_summary = {}
+        topics_in_slice = list(set(topics))
+        for topic in topics_in_slice:
+            vecs_in_topic = model.docvecs.vectors_docs[topics == topic, :]
+
+            topic_vector = vecs_in_topic.mean(axis=0)
+            topic_top_words = []
+            if self.similarity_method == "centroid":
+                topic_top_words = [term for (term, _) in model.wv.most_similar([topic_vector], topn=self.n_terms)]
+            elif self.similarity_method == "vote":
+                top_n_per_article = []
+                for vec_index in range(vecs_in_topic.shape[0]):
+                    vec = vecs_in_topic[vec_index]
+                    arts = [term for (term, _) in model.wv.most_similar([vec], topn=self.n_terms)]
+                    top_n_per_article += arts
+                counter = Counter(top_n_per_article)
+                topic_top_words = [term for (term, _) in counter.most_common(self.n_terms)]
+            else:
+                raise Exception("Please select a valid similarity_method")
+            topic_summary[topic] = {"topvec": topic_vector, "topn": topic_top_words}
+        return topic_summary
+    def name(self, i):
+        """
+        Names the time slice based on whether it is yearly or something else.
+        """
+        time = self.time_intervals[i]
+        if self.yearly:
+            return time.year
+        else:
+            return time.strftime("%Y/%m/%d")
+    
+    def obtain_term(self, terms):
+        if type(terms) == str:
+            terms = [terms]
+        terms_path = os.path.join(self.file_path, "terms.csv")
+        df = pd.read_csv(terms_path)
+        for term in terms:
+            df = df[df['term'] != term]
+        term_terms = []
+        term_slices = []
+        term_vectors = []
+        for slic in self.obtain_slices():
+            slice_path = os.path.join(self.file_path, "slices", f"{slic}.pkl")
+            ts = load(slice_path)
+            for term in terms:
+                if term in ts.model.wv.index2word:
+                    term_slices.append(slic)
+                    term_vectors.append(ts.model.wv[term])
+                    term_terms.append(term)
+            del ts
+        ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
+#         print(term_slices, term_vectors)
+        red = ump_2d.transform(term_vectors)
+        del ump_2d
+        addition = pd.DataFrame({'term': term_terms, 'ts': term_slices,
+                                 'x': red[:, 0], 'y': red[:, 1]})
+        df = pd.concat([df, addition], ignore_index=True)
+        df['label'] = df['term'] + ' - ' + df['ts'].astype(str)
+        df.to_csv(terms_path, index=False)
+        del df
+    def plot_compass_term(self, term = None, n_terms = None, years = None, plot="full", n_closest=10, similarity_threshold=0.4):
+        """
+        Plots the compass and the selected terms
+        :param term: string or list of string terms
+        :param n_terms: Number of terms per topic
+        :param years: Pick specific time periods
+        :param plot: either "full" (plot everything), "near" (nearest neighbors of terms), or "none" (plot just the terms)
+        :param n_closest: if plot is "near" determine how many nearest articles to use
+        :param similarity_threshold: "near" parameter to determine the smallest cosine similarity a "closest article" can be to a term
+        """
+        
+        if not term:
+            raise Exception("Please say what term(s) you want")
+        elif type(term) == str:
+            term = [term]
+        if not years:
+            years = self.obtain_slices()
+        else:
+            years = list(years)
+        if n_terms:
+            n_terms = min(n_terms, self.n_terms)
+        terms_path = os.path.join(self.file_path, "terms.csv")
+        df = pd.read_csv(terms_path)
+        df = df[df['ts'].isin(years)].reset_index()
+        for t in term:
+            if df["term"].str.contains(t).sum() == 0:
+                raise Exception(f"The term {t} has not been cached using obtain_terms")
+        fig = make_subplots(rows=1, cols=1)
+        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        if plot == "full":
+            global_topic_summary = load(topics_path)
+            hdb = load(os.path.join(self.file_path, "hdbscan.pkl"))
+            ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
+            for tn in np.unique(hdb.labels_):
+                if tn == -1:
+                    continue
+                sub = ump_2d.embedding_[[i for i,topic in enumerate(hdb.labels_) if topic == tn],:]
+                if n_terms > 0:
+                    nam = f"{tn} - {','.join(global_topic_summary[tn]['topn'][0:n_terms])} "
+                else:
+                    nam = str(tn)
+                fig.add_trace(go.Scatter(x=sub[:,0], y=sub[:,1], mode="markers", name=nam))
+            del hdb
+            del ump_2d
+        elif plot == "near":
+            doc_titles = []
+            doc_coordinates = []
+            doc_tops = []
+            for year in years:
+                slic = self.load_slice(year)
+                sub = df[df['ts'] == year].reset_index()
+                for t in sub['term']:
+                    if t not in term:
+                        continue
+                    closest_titles = [i for i, sim in slic.model.docvecs.most_similar([slic.model.wv[t]], topn=n_closest) if sim > similarity_threshold]
+                    # Need to check if len(slic.model.docvecs.index2entity) == 0
+                    if len(slic.model.docvecs.index2entity) == 0:
+                        closest_idx = closest_titles
+                    else:
+                        closest_idx = [slic.model.docvecs.index2entity.index(title) for title in closest_titles]
+                    closest_titles = [f"{title} - {year}" for title in closest_titles]
+                    doc_titles += closest_titles
+                    doc_coordinates.append(slic.umap_2d[closest_idx, :])
+                    doc_tops.append(slic.topics[closest_idx])
+            doc_coordinates = np.concatenate(doc_coordinates)
+            doc_tops = np.concatenate(doc_tops)
+            if n_terms > 0:
+                global_topic_summary = load(topics_path)
+            for tn in np.unique(doc_tops):
+                # if tn == -1:
+                #     continue
+                sub_idx = [i for i, t in enumerate(doc_tops) if t == tn]
+                if tn == -1:
+                    nam = "noise"
+                elif n_terms > 0:
+                    nam = f"{tn} - {','.join(global_topic_summary[tn]['topn'][0:n_terms])} "
+                else:
+                    nam = str(tn)
+                fig.add_trace(go.Scatter(x=doc_coordinates[sub_idx, 0], y=doc_coordinates[sub_idx, 1], mode="markers", text=[title for i, title in enumerate(doc_titles) if i in sub_idx], name=nam))
+
+        elif plot == "none":
+            pass
+        else:
+            raise Exception("Pick 'full' 'near' or 'none' for plot")
+        for t in term:
+            sub = df[df['term'] == t].reset_index()
+            fig.add_trace(go.Scatter(x=sub["x"], y=sub["y"], text=sub["label"], mode="markers+text+lines", line=dict(color="black"), textposition=improve_text_position(sub.index), name=t))
+        fig.show()
+    def plot_compass(self, n_terms = None, alpha=0.5):
+        """
+        Plots what the compass using plotly express.
+        """
+        if n_terms:
+            n_terms = min(n_terms, self.n_terms)
+        comp_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
+                              'y': self.compass.compass_umap_2d.embedding_[:,1],
+                               'topic': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
+                               })
+        fig = px.scatter(comp_df, x='x', y='y', color='topic', opacity=alpha, title="Compass")
+        fig.show()
+    def plot_slice(self, slice_num, n_terms = None):
+        """
+        Plots a single time slice using plotly express.
+        """
+        if n_terms:
+            n_terms = min(n_terms, self.n_terms)
+        
+        wrap_slice = self.slices[slice_num]
+        list_of_names = list_of_names = [" ".join([f"{i}:"]+wrap_slice.topic_summary[i]["topn"][0:n_terms]) for i in wrap_slice.topics.tolist()]
+        wrap_slice_df = pd.DataFrame({'x': wrap_slice.umap_2d[:,0],
+                                      'y': wrap_slice.umap_2d[:,1],
+                                      'name': list_of_names
+                                     })
+        fig = px.scatter(wrap_slice_df, x='x', y='y', color='name', title=slice_num)
+        fig.show()
+    def plot_slider_scatter(self, n_terms=5):
+        """
+        Plots all time slices and compass with a slider
+        """
+        fig = go.Figure()
+        wrap_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
+                                          'y': self.compass.compass_umap_2d.embedding_[:,1],
+                                          'topic': map(str,self.compass.global_topics.tolist()),#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrapper.compass.global_topics.tolist()],
+                                          'date': "compass",
+                                          'name': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
+                                         })
+        # wrap_df = pd.DataFrame()
+        for step in list(self.slices.keys()):
+            wrap_slice = self.slices[step]
+            wrap_slice_df = pd.DataFrame({'x': wrap_slice.umap_2d[:,0],
+                                          'y': wrap_slice.umap_2d[:,1],
+                                          'topic': map(str,wrap_slice.topics.tolist()),#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrap_slice.topics.tolist()],
+                                          'date': step,
+                                          'name': [" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrap_slice.topics.tolist()]
+                                         })
+            wrap_df = pd.concat([wrap_df,wrap_slice_df])
+        fig = px.scatter(wrap_df, x="x", y="y", color="topic", animation_frame="date", title="Scatterplots of Compass and Time Slices", hover_data=["name"])
+        fig["layout"].pop("updatemenus") # optional, drop animation buttons
+        fig.show()
+    def plot_line(self, include_noise = False, n_terms=5, drop_unique=True):
+        """
+        Plots a line graph that shows the amount of articles in each topic
+        per time period
+        """
+        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        global_topics = load(topics_path)
+        df_list = []
+        for slic in self.obtain_slices():
+            slice_path = os.path.join(self.file_path, "slices", f"{slic}.pkl")
+            ts = load(slice_path)
+            topic_counts = np.unique(ts.topics, return_counts=True)
+            for topic in topic_counts[0]:
+                if topic == -1 and not include_noise:
+                    continue
+                words = ts.topic_summary[topic]["topn"][:n_terms]
+                count = topic_counts[1][topic_counts[0] == topic][0]
+                df_list.append([slic, f"{topic} - {' '.join(global_topics[topic]['topn'][:n_terms])}", count, words])
+        for date, slic in self.slices.items():
+            topic_counts = np.unique(slic.topics, return_counts=True)
+        df = pd.DataFrame(df_list, columns=["Date", "Cluster", "Counts", "Words"])
+        fig = px.line(df, x="Date", y="Counts", color="Cluster", hover_data="Words")
+        fig.show()
+    def plot_line_terms(self, terms, include_noise = False, n_terms=5, drop_unique=True):
+        """
+        Plots a line graph that shows the amount of articles in each topic
+        per time period
+        """
+        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        global_topics = load(topics_path)
+        df_list = []
+        for slic in self.obtain_slices():
+            slice_path = os.path.join(self.file_path, "slices", f"{slic}.pkl")
+            ts = load(slice_path)
+            topic_counts = np.unique(ts.topics, return_counts=True)
+            for topic in topic_counts[0]:
+                topic_words = global_topics[topic]['topn']
+                if (topic == -1 and not include_noise) or \
+                (len(set(terms).intersection(set(topic_words))) == 0):
+                    continue
+                words = ts.topic_summary[topic]["topn"][:n_terms]
+                count = topic_counts[1][topic_counts[0] == topic][0]
+                topic_words = list(set(topic_words).intersection(set(terms))) +\
+                list(set(topic_words) - set(terms)) # Brings terms of interest up front
+                df_list.append([slic, f"{topic} - {' '.join(topic_words[:n_terms])}", count, words])
+        for date, slic in self.slices.items():
+            topic_counts = np.unique(slic.topics, return_counts=True)
+        df = pd.DataFrame(df_list, columns=["Date", "Cluster", "Counts", "Words"])
+        if drop_unique:
+            df = df[df.groupby('Cluster').Cluster.transform('count')>1].copy()
+        fig = px.line(df, x="Date", y="Counts", color="Cluster", hover_data="Words")
+        fig.show()
+    def obtain_slices(self):
+        files = []
+        for file in os.listdir(os.path.join(self.file_path, 'slices/')):
+            if file.endswith('.pkl'):
+                files.append(int(file[:-4]))
+        files.sort()
+        return files
+    
+    def load_slice(self, slice_name):
+        if slice_name not in self.obtain_slices():
+            raise Exception("Slice name does not exist")
+        return load(os.path.join(self.file_path, 'slices/', str(slice_name)+'.pkl'))
+    
+    def topic_distribution(self):
+        """
+        Obtains compass topic distribution
+        """
+        return np.unique(self.compass.hdbscan.labels_, return_counts=True)
+    def test_coherence(self, return_annual_count = False):
+        """
+        Tests coherence of topics.
+        return_annual_count - Breaks down by time slice
+        """
+        annual_count = {}
+        for idx, date in enumerate(self.slices):
+            slic = self.slices[date]
+            sentences_subset = self._obtain_sentence_subset(idx)
+#         print(sentences_subset[0])
+#         sentences_subset = [simple_preprocess(" ".join(doc)) for doc in sentences_subset]
+            dic = corpora.Dictionary()
+            BoW_corpus = [dic.doc2bow(doc, allow_update=True) for doc in sentences_subset]
+            topics = [slic.topic_summary[thing]['topn'] for thing in slic.topic_summary]  
+#         texts = [[dictionary.token2id[word] for word in sentence] for sentence in sentences_subset]
+            mod = CoherenceModel(topics=topics, texts=sentences_subset, dictionary=dic, topn=10, coherence='c_npmi')
+            annual_count[date] = mod.get_coherence()
+#         annual_count[date] = np.mean(np.array(local_count))
+        if return_annual_count:
+            return (annual_count, np.mean(np.array(list(annual_count.values()))))
+        else:
+            return np.mean(np.array(list(annual_count.values())))
+
+    def test_diversity(self, return_annual_count = False):
+        """
+        Tests diversity of topics.
+        return_annual_count - Breaks down by time slice
+        """
+        annual_count = {}
+        for date in self.slices:
+            slic = self.slices[date]
+            local_count = {}
+            for topic_number in slic.topic_summary:
+                if topic_number != -1:
+                    topic_words = slic.topic_summary[topic_number]["topn"]
+                    for word in topic_words:
+                        try:
+                            local_count[word] += 1
+                        except:
+                            local_count[word] = 1
+            annual_count[date] = local_count
+        sums = []
+        for date in annual_count.keys():
+            slic = annual_count[date]
+            sums.append(np.mean(np.array(list(slic.values())) == 1))
+        if return_annual_count:
+            return (np.mean(sums), sums)
+        else:
+            return np.mean(sums)
 def save(obj, fname):
     """
     pickle wrapper for saving CADE
@@ -946,6 +1493,12 @@ def load(fname):
     """
     with open(fname, 'rb') as f:
         return pickle.load(f, encoding='latin1')  # needed because loading from S3 doesn't support readline()
+    
+def improve_text_position(x):
+    """ it is more efficient if the x values are sorted """
+    # fix indentation 
+    positions = ['top left', 'top center', 'top right', 'middle right', 'bottom right', 'bottom center', 'bottom left', 'middle left']
+    return [positions[i % len(positions)] for i in range(len(x))]
 
 def create_df_json(sentences = None, corpus_file=None, timestamps=None,
                    loops_=5, w2v_dim_=[50, 100, 200, 300], topic_embed_dim_=[5,10],
@@ -974,7 +1527,7 @@ def create_df_json(sentences = None, corpus_file=None, timestamps=None,
             wrapper.compass.train_compass(corpus_file=corpus_file,
                                           sentences=[TaggedDocument(sentence, [i]) for i, sentence in enumerate(sentences)] if sentences else None
                                          )
-            wrapper.compass_umap_2d = UMAP(n_neighbors = 15).fit(wrapper.compass.compass.docvecs.vectors_docs)
+            wrapper.compass.compass_umap_2d = UMAP(n_neighbors = 15).fit(wrapper.compass.compass.docvecs.vectors_docs)
             wrapper.train_slices() #
 
             embedding_dic = {}
@@ -1068,4 +1621,3 @@ def gen_coh(wrapper):
         out.append(mod.get_coherence())
 #         annual_count[date] = np.mean(np.array(local_count))
     return np.mean(np.array(out)), out
-
