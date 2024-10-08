@@ -24,6 +24,8 @@ from plotly.subplots import make_subplots
 from gensim.models.coherencemodel import CoherenceModel
 from gensim import corpora
 
+from scipy.spatial import distance
+
 from numba import set_num_threads, get_num_threads
 
 import sys
@@ -826,8 +828,8 @@ class TTEC_wrapper:
                                'topic': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
                                })
         fig = px.scatter(comp_df, x='x', y='y', color='topic', opacity=alpha, title="Compass")
-        fig.show()
-    def plot_compass_term(self, term = None, n_terms = None, years = None):
+        return fig
+    def plot_term(self, term = None, n_terms = None, years = None):
         if not term:
             print("Please say what term(s) you want")
             return
@@ -861,7 +863,7 @@ class TTEC_wrapper:
                 twod = self.compass.compass_umap_2d.transform(term_vectors)
                 lis_df = pd.DataFrame({'name': term_id, 'x': twod[:,0] , 'y': twod[:,1]})
                 fig.add_trace(go.Scatter(x=lis_df["x"], y=lis_df["y"], text=lis_df["name"], mode="markers+text+lines", line=dict(color="black"), textposition=improve_text_position(lis_df.index), name=t))
-        fig.show()
+        return fig
     def plot_slice(self, slice_num, n_terms = None):
         """
         Plots a single time slice using plotly express.
@@ -876,7 +878,7 @@ class TTEC_wrapper:
                                       'name': list_of_names
                                      })
         fig = px.scatter(wrap_slice_df, x='x', y='y', color='name', title=slice_num)
-        fig.show()
+        return fig
     def plot_slider_scatter(self, n_terms=5):
         """
         Plots all time slices and compass with a slider
@@ -900,7 +902,7 @@ class TTEC_wrapper:
             wrap_df = pd.concat([wrap_df,wrap_slice_df])
         fig = px.scatter(wrap_df, x="x", y="y", color="topic", animation_frame="date", title="Scatterplots of Compass and Time Slices", hover_data=["name"])
         fig["layout"].pop("updatemenus") # optional, drop animation buttons
-        fig.show()
+        return fig
     def plot_line(self, include_noise = False, n_terms=5):
         """
         Plots a line graph that shows the amount of articles in each topic
@@ -917,7 +919,7 @@ class TTEC_wrapper:
                 df_list.append([date, f"{topic} - {' '.join(self.compass.global_topic_summary[topic]['topn'][:n_terms])}", count, words])
         df = pd.DataFrame(df_list, columns=["Date", "Cluster", "Counts", "Words"])
         fig = px.line(df, x="Date", y="Counts", color="Cluster", hover_data="Words")
-        fig.show()
+        return fig
     def topic_distribution(self):
         """
         Obtains compass topic distribution
@@ -1061,7 +1063,7 @@ class TTEC_big:
             logging.info("UMAP loaded")
         del tdec
         hdbscan_path = os.path.join(self.file_path, "hdbscan.pkl")
-        if (overwrite and os.path.exists(hdbscan_path)) or not os.path.exists(tdec_path):
+        if (overwrite and os.path.exists(hdbscan_path)) or not os.path.exists(hdbscan_path):
             if self.hdbscan_args:
                 hdbscan_args = self.hdbscan_args
             else:
@@ -1077,14 +1079,19 @@ class TTEC_big:
             hdb = load(hdbscan_path)
             logging.info("HDBSCAN loaded")
         del ump
-        topics_path = os.path.join(self.file_path, "global_topics.pkl")
-        if (overwrite and os.path.exists(topics_path)) or not os.path.exists(topics_path):
-            tdec = load(tdec_path)
-            topics = self._topic_summary(tdec.compass,  hdb.labels_)
-            save(topics, topics_path)
+        global_topic_path = os.path.join(self.file_path, "global_topics.pkl")
+        if (overwrite and os.path.exists(global_topic_path)) or not os.path.exists(global_topic_path):
+            global_topics = hdb.labels_
+            save(global_topics, global_topic_path)
             logging.info("Topics made")
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        if (overwrite and os.path.exists(topic_description_path)) or not os.path.exists(topic_description_path):
+            tdec = load(tdec_path)
+            description = self._topic_summary(tdec.compass,  hdb.labels_)
+            save(description, topic_description_path)
+            logging.info("Topic summary made")
             del tdec
-            del topics
+            del description
         del hdb
         
     def train_slice(self, name):
@@ -1164,23 +1171,74 @@ class TTEC_big:
         topics_in_slice = list(set(topics))
         for topic in topics_in_slice:
             vecs_in_topic = model.docvecs.vectors_docs[topics == topic, :]
-
-            topic_vector = vecs_in_topic.mean(axis=0)
-            topic_top_words = []
-            if self.similarity_method == "centroid":
-                topic_top_words = [term for (term, _) in model.wv.most_similar([topic_vector], topn=self.n_terms)]
-            elif self.similarity_method == "vote":
-                top_n_per_article = []
-                for vec_index in range(vecs_in_topic.shape[0]):
-                    vec = vecs_in_topic[vec_index]
-                    arts = [term for (term, _) in model.wv.most_similar([vec], topn=self.n_terms)]
-                    top_n_per_article += arts
-                counter = Counter(top_n_per_article)
-                topic_top_words = [term for (term, _) in counter.most_common(self.n_terms)]
-            else:
-                raise Exception("Please select a valid similarity_method")
-            topic_summary[topic] = {"topvec": topic_vector, "topn": topic_top_words}
+            topic_summary[topic] = self._summary_one_topic(model, vecs_in_topic)
         return topic_summary
+    def _summary_one_topic(self, model, vecs_in_topic):
+        topic_vector = vecs_in_topic.mean(axis=0)
+        topic_top_words = []
+        if self.similarity_method == "centroid":
+            topic_top_words = [term for (term, _) in model.wv.most_similar([topic_vector], topn=self.n_terms)]
+        elif self.similarity_method == "vote":
+            top_n_per_article = []
+            for vec_index in range(vecs_in_topic.shape[0]):
+                vec = vecs_in_topic[vec_index]
+                arts = [term for (term, _) in model.wv.most_similar([vec], topn=self.n_terms)]
+                top_n_per_article += arts
+            counter = Counter(top_n_per_article)
+            topic_top_words = [term for (term, _) in counter.most_common(self.n_terms)]
+        else:
+            raise Exception("Please select a valid similarity_method")
+        return {"topvec": topic_vector, "topn": topic_top_words}
+
+    def reduce_topics(self, n_topics, remake_slices=True):
+        """
+        Reduces the number of topics. Only works for nested option.
+        """
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        topic_description = load(topic_description_path)
+        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        global_topics = load(topics_path)
+        if n_topics + 2 >= len(topic_description):
+            return
+        tdec_path = os.path.join(self.file_path, "tdec.pkl")
+        tdec = load(tdec_path)
+        self.changes = {}
+        for t in topic_description:
+            self.changes[t] = t
+        counter = Counter(global_topics)
+        while n_topics + 2 <= len(topic_description):
+            f = min(counter, key=counter.get)
+            top_matrix = np.array([topic_description[t]["topvec"] for t in topic_description if t not in [-1, f]])
+            
+            distances = distance.cdist(topic_description[f]["topvec"].reshape(1,-1), top_matrix, "cosine")[0]
+            closest_idx = np.argmin(distances)
+            t = list(k for k in topic_description if k not in [-1, f])[closest_idx]
+            global_topics[global_topics == f] = t
+            self.changes[f] = t
+            for k, v in self.changes.items():
+                if v == f:
+                    self.changes[k] = t
+#             print(f"Topics left: {len(topic_description)}")
+#             print(f"Merging {f} into {t}")
+#             print(topic_description[f]["topn"], topic_description[t]["topn"])
+            counter[t] += counter[f]
+            counter.pop(f)
+            topic_description[t] = self._summary_one_topic(tdec.compass,  tdec.compass.docvecs.vectors_docs[global_topics == t])
+            topic_description.pop(f)
+        save(tdec, tdec_path)
+        save(topic_description, topic_description_path)
+        save(global_topics, topics_path)
+        del tdec
+        del topic_description
+        del global_topics
+        for i in self.obtain_slices():
+            slice_path = os.path.join(self.file_path, "slices", f"{i}.pkl")
+            ts = load(slice_path)
+            ts.topics = [self.changes[t] for t in ts.topics]
+            for t in np.unique(ts.topics):
+                ts.topic_summary[t] = self._summary_one_topic(ts.model, ts.model.docvecs.vectors_docs[ts.topics == t])
+            save(ts, slice_path)
+            del ts
     def name(self, i):
         """
         Names the time slice based on whether it is yearly or something else.
@@ -1220,11 +1278,11 @@ class TTEC_big:
         df['label'] = df['term'] + ' - ' + df['ts'].astype(str)
         df.to_csv(terms_path, index=False)
         del df
-    def plot_compass_term(self, term = None, n_terms = None, years = None, plot="full", n_closest=10, similarity_threshold=0.4):
+    def plot_term(self, term = None, n_terms = None, years = None, plot="near", n_closest=10, similarity_threshold=0.4):
         """
-        Plots the compass and the selected terms
+        Plots the compass/time slice and the selected terms
         :param term: string or list of string terms
-        :param n_terms: Number of terms per topic
+        :param n_terms: Number of descriptor terms per topic
         :param years: Pick specific time periods
         :param plot: either "full" (plot everything), "near" (nearest neighbors of terms), or "none" (plot just the terms)
         :param n_closest: if plot is "near" determine how many nearest articles to use
@@ -1237,33 +1295,70 @@ class TTEC_big:
             term = [term]
         if not years:
             years = self.obtain_slices()
-        else:
-            years = list(years)
+        elif type(years) == int:
+            years = [years]
         if n_terms:
             n_terms = min(n_terms, self.n_terms)
         terms_path = os.path.join(self.file_path, "terms.csv")
         df = pd.read_csv(terms_path)
-        df = df[df['ts'].isin(years)].reset_index()
         for t in term:
             if df["term"].str.contains(t).sum() == 0:
                 raise Exception(f"The term {t} has not been cached using obtain_terms")
+        df = df[df['ts'].isin(years) & df["term"].isin(term)].reset_index()
         fig = make_subplots(rows=1, cols=1)
-        topics_path = os.path.join(self.file_path, "global_topics.pkl")
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
         if plot == "full":
-            global_topic_summary = load(topics_path)
-            hdb = load(os.path.join(self.file_path, "hdbscan.pkl"))
+            global_topic_summary = load(topic_description_path)
+            global_topics = load(os.path.join(self.file_path, "global_topics.pkl"))
             ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
-            for tn in np.unique(hdb.labels_):
-                if tn == -1:
-                    continue
+            for tn in np.unique(global_topics):
+#                 if tn == -1:
+#                     continue
                 sub = ump_2d.embedding_[[i for i,topic in enumerate(hdb.labels_) if topic == tn],:]
                 if n_terms > 0:
                     nam = f"{tn} - {','.join(global_topic_summary[tn]['topn'][0:n_terms])} "
                 else:
                     nam = str(tn)
                 fig.add_trace(go.Scatter(x=sub[:,0], y=sub[:,1], mode="markers", name=nam))
-            del hdb
+            del global_topics
             del ump_2d
+        elif plot == "subset":
+            doc_titles = []
+            doc_coordinates = []
+            doc_tops = []
+            for year in years:
+                slic = self.load_slice(year)
+                sub = df[df['ts'] == year].reset_index()
+                for t in sub['term']:
+                    if t not in term:
+                        continue
+                    closest_titles = [i for i, sim in slic.model.docvecs.most_similar([slic.model.wv[t]], topn=n_closest) if sim > similarity_threshold]
+                    # Need to check if len(slic.model.docvecs.index2entity) == 0
+                    if len(slic.model.docvecs.index2entity) == 0:
+                        closest_idx = closest_titles
+                    else:
+                        closest_idx = [slic.model.docvecs.index2entity.index(title) for title in closest_titles]
+                    doc_titles += [f"{title} - {year}" for title in slic.model.docvecs.index2entity]
+                    doc_coordinates.append(slic.umap_2d)
+                    doc_tops.append(slic.topics)
+            doc_coordinates = np.concatenate(doc_coordinates)
+            doc_tops = np.concatenate(doc_tops)
+            if n_terms > 0 and len(years) > 1:
+                topic_summary = load(topic_description_path)
+            elif n_terms > 0 and len(years) == 1:
+                topic_summary = self.load_slice(years[0])
+                topic_summary = topic_summary.topic_summary
+            for tn in np.unique(doc_tops):
+                # if tn == -1:
+                #     continue
+                sub_idx = [i for i, t in enumerate(doc_tops) if t == tn]
+                if tn == -1:
+                    nam = "noise"
+                elif n_terms > 0:
+                    nam = f"{tn} - {','.join(topic_summary[tn]['topn'][0:n_terms])} "
+                else:
+                    nam = str(tn)
+                fig.add_trace(go.Scatter(x=doc_coordinates[sub_idx, 0], y=doc_coordinates[sub_idx, 1], mode="markers", text=[title for i, title in enumerate(doc_titles) if i in sub_idx], name=nam, marker=dict(color=px.colors.qualitative.Plotly[(tn + 1) % 10])))
         elif plot == "near":
             doc_titles = []
             doc_coordinates = []
@@ -1287,7 +1382,7 @@ class TTEC_big:
             doc_coordinates = np.concatenate(doc_coordinates)
             doc_tops = np.concatenate(doc_tops)
             if n_terms > 0:
-                global_topic_summary = load(topics_path)
+                global_topic_summary = load(topic_description_path)
             for tn in np.unique(doc_tops):
                 # if tn == -1:
                 #     continue
@@ -1298,28 +1393,41 @@ class TTEC_big:
                     nam = f"{tn} - {','.join(global_topic_summary[tn]['topn'][0:n_terms])} "
                 else:
                     nam = str(tn)
-                fig.add_trace(go.Scatter(x=doc_coordinates[sub_idx, 0], y=doc_coordinates[sub_idx, 1], mode="markers", text=[title for i, title in enumerate(doc_titles) if i in sub_idx], name=nam))
+                fig.add_trace(go.Scatter(x=doc_coordinates[sub_idx, 0], y=doc_coordinates[sub_idx, 1], mode="markers", text=[title for i, title in enumerate(doc_titles) if i in sub_idx], name=nam, marker=dict(color=px.colors.qualitative.Plotly[(tn + 1) % 10])))
 
         elif plot == "none":
             pass
         else:
             raise Exception("Pick 'full' 'near' or 'none' for plot")
-        for t in term:
-            sub = df[df['term'] == t].reset_index()
-            fig.add_trace(go.Scatter(x=sub["x"], y=sub["y"], text=sub["label"], mode="markers+text+lines", line=dict(color="black"), textposition=improve_text_position(sub.index), name=t))
-        fig.show()
+        if len(years) == 1:
+            fig.add_trace(go.Scatter(x=df["x"], y=df["y"], text=df["term"], mode="markers+text", marker=dict(color="black"), name="terms"))
+        else:
+            for t in term:
+                sub = df[df['term'] == t].reset_index()
+                fig.add_trace(go.Scatter(x=sub["x"], y=sub["y"], text=sub["label"], mode="markers+text+lines", line=dict(color="black"), textposition=improve_text_position(sub.index), name=t))
+        return fig
     def plot_compass(self, n_terms = None, alpha=0.5):
         """
         Plots what the compass using plotly express.
         """
         if n_terms:
             n_terms = min(n_terms, self.n_terms)
-        comp_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
-                              'y': self.compass.compass_umap_2d.embedding_[:,1],
-                               'topic': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
+        ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
+        comp_df = pd.DataFrame({'x': ump_2d.embedding_[:,0],
+                              'y': ump_2d.embedding_[:,1],
                                })
-        fig = px.scatter(comp_df, x='x', y='y', color='topic', opacity=alpha, title="Compass")
-        fig.show()
+        del ump_2d
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        global_topic_summary = load(topic_description_path)
+        global_topics = load(os.path.join(self.file_path, "global_topics.pkl"))
+        
+        comp_df['topic'] = [str(global_topics[i]) + ': ' + " ".join(global_topic_summary[global_topics[i]]["topn"][0:n_terms]) for i in range(global_topics.shape[0])]
+        color_dict = {}
+        for i in list(set(global_topics)):
+            color_dict[str(i) + ': ' + " ".join(global_topic_summary[i]["topn"][0:n_terms])] = px.colors.qualitative.Plotly[(i + 1) % 10]
+        del global_topic_summary
+        fig = px.scatter(comp_df, x='x', y='y', color='topic', opacity=alpha, title="Compass", color_discrete_map=color_dict)
+        return fig
     def plot_slice(self, slice_num, n_terms = None):
         """
         Plots a single time slice using plotly express.
@@ -1327,28 +1435,41 @@ class TTEC_big:
         if n_terms:
             n_terms = min(n_terms, self.n_terms)
         
-        wrap_slice = self.slices[slice_num]
-        list_of_names = list_of_names = [" ".join([f"{i}:"]+wrap_slice.topic_summary[i]["topn"][0:n_terms]) for i in wrap_slice.topics.tolist()]
+        wrap_slice = self.load_slice(slice_num)
+        list_of_names = [" ".join([f"{i}:"]+wrap_slice.topic_summary[i]["topn"][0:n_terms]) for i in wrap_slice.topics]
         wrap_slice_df = pd.DataFrame({'x': wrap_slice.umap_2d[:,0],
                                       'y': wrap_slice.umap_2d[:,1],
                                       'name': list_of_names
                                      })
-        fig = px.scatter(wrap_slice_df, x='x', y='y', color='name', title=slice_num)
-        fig.show()
+        color_dict = {}
+        for i in list(set(wrap_slice.topics)):
+            color_dict[" ".join([f"{i}:"]+wrap_slice.topic_summary[i]["topn"][0:n_terms])] = px.colors.qualitative.Plotly[(i + 1) % 10]
+        fig = px.scatter(wrap_slice_df, x='x', y='y', color='name', title=slice_num, color_discrete_map=color_dict)
+        return fig
     def plot_slider_scatter(self, n_terms=5):
         """
         Plots all time slices and compass with a slider
         """
+        if n_terms:
+            n_terms = min(n_terms, self.n_terms)
         fig = go.Figure()
-        wrap_df = pd.DataFrame({'x': self.compass.compass_umap_2d.embedding_[:,0],
-                                          'y': self.compass.compass_umap_2d.embedding_[:,1],
-                                          'topic': map(str,self.compass.global_topics.tolist()),#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrapper.compass.global_topics.tolist()],
-                                          'date': "compass",
-                                          'name': [str(self.compass.global_topics[i]) + ': ' + " ".join(self.compass.global_topic_summary[self.compass.global_topics[i]]["topn"][0:n_terms]) for i in range(self.compass.global_topics.shape[0])]
-                                         })
-        # wrap_df = pd.DataFrame()
-        for step in list(self.slices.keys()):
-            wrap_slice = self.slices[step]
+        ump_2d = load(os.path.join(self.file_path, "umap_2d.pkl"))
+        wrap_df = pd.DataFrame({'x': ump_2d.embedding_[:,0],
+                              'y': ump_2d.embedding_[:,1],
+                               })
+        del ump_2d
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        global_topic_summary = load(topic_description_path)
+        global_topics = load(os.path.join(self.file_path, "global_topics.pkl"))
+        
+        wrap_df['name'] = [str(hdb.labels_[i]) + ': ' + " ".join(global_topic_summary[global_topics[i]]["topn"][0:n_terms]) for i in range(hdb.labels_.shape[0])]
+        wrap_df["topic"] = list(map(str, global_topics.tolist()))#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrapper.compass.global_topic_description.tolist()],
+        del global_topics
+        del global_topic_summary
+        wrap_df['date'] = 'compass'
+        fig = px.scatter()
+        for step in self.obtain_slices():
+            wrap_slice = self.load_slice(step)
             wrap_slice_df = pd.DataFrame({'x': wrap_slice.umap_2d[:,0],
                                           'y': wrap_slice.umap_2d[:,1],
                                           'topic': map(str,wrap_slice.topics.tolist()),#[" ".join([f"{i}:"] + wrap_slice.topic_summary[i]["topn"]) for i in wrap_slice.topics.tolist()],
@@ -1358,14 +1479,14 @@ class TTEC_big:
             wrap_df = pd.concat([wrap_df,wrap_slice_df])
         fig = px.scatter(wrap_df, x="x", y="y", color="topic", animation_frame="date", title="Scatterplots of Compass and Time Slices", hover_data=["name"])
         fig["layout"].pop("updatemenus") # optional, drop animation buttons
-        fig.show()
+        return fig
     def plot_line(self, include_noise = False, n_terms=5, drop_unique=True):
         """
         Plots a line graph that shows the amount of articles in each topic
         per time period
         """
-        topics_path = os.path.join(self.file_path, "global_topics.pkl")
-        global_topics = load(topics_path)
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        global_topic_description = load(topic_description_path)
         df_list = []
         for slic in self.obtain_slices():
             slice_path = os.path.join(self.file_path, "slices", f"{slic}.pkl")
@@ -1376,26 +1497,26 @@ class TTEC_big:
                     continue
                 words = ts.topic_summary[topic]["topn"][:n_terms]
                 count = topic_counts[1][topic_counts[0] == topic][0]
-                df_list.append([slic, f"{topic} - {' '.join(global_topics[topic]['topn'][:n_terms])}", count, words])
+                df_list.append([slic, f"{topic} - {' '.join(global_topic_description[topic]['topn'][:n_terms])}", count, words])
         for date, slic in self.slices.items():
             topic_counts = np.unique(slic.topics, return_counts=True)
         df = pd.DataFrame(df_list, columns=["Date", "Cluster", "Counts", "Words"])
         fig = px.line(df, x="Date", y="Counts", color="Cluster", hover_data="Words")
-        fig.show()
+        return fig
     def plot_line_terms(self, terms, include_noise = False, n_terms=5, drop_unique=True):
         """
         Plots a line graph that shows the amount of articles in each topic
         per time period
         """
-        topics_path = os.path.join(self.file_path, "global_topics.pkl")
-        global_topics = load(topics_path)
+        topic_description_path = os.path.join(self.file_path, "global_topic_description.pkl")
+        global_topic_description = load(topic_description_path)
         df_list = []
         for slic in self.obtain_slices():
             slice_path = os.path.join(self.file_path, "slices", f"{slic}.pkl")
             ts = load(slice_path)
             topic_counts = np.unique(ts.topics, return_counts=True)
             for topic in topic_counts[0]:
-                topic_words = global_topics[topic]['topn']
+                topic_words = global_topic_description[topic]['topn']
                 if (topic == -1 and not include_noise) or \
                 (len(set(terms).intersection(set(topic_words))) == 0):
                     continue
@@ -1410,7 +1531,7 @@ class TTEC_big:
         if drop_unique:
             df = df[df.groupby('Cluster').Cluster.transform('count')>1].copy()
         fig = px.line(df, x="Date", y="Counts", color="Cluster", hover_data="Words")
-        fig.show()
+        return fig
     def obtain_slices(self):
         files = []
         for file in os.listdir(os.path.join(self.file_path, 'slices/')):
@@ -1436,7 +1557,7 @@ class TTEC_big:
         """
         annual_count = {}
         for idx, date in enumerate(self.slices):
-            slic = self.slices[date]
+            slic = self.load_slice(date)
             sentences_subset = self._obtain_sentence_subset(idx)
 #         print(sentences_subset[0])
 #         sentences_subset = [simple_preprocess(" ".join(doc)) for doc in sentences_subset]
@@ -1459,7 +1580,7 @@ class TTEC_big:
         """
         annual_count = {}
         for date in self.slices:
-            slic = self.slices[date]
+            slic = self.load_slice(date)
             local_count = {}
             for topic_number in slic.topic_summary:
                 if topic_number != -1:
